@@ -14,6 +14,8 @@ import click
 from tqdm import tqdm
 from tzlocal import get_localzone
 
+from future.moves.urllib.parse import urlencode
+
 from pyicloud_ipd.exceptions import PyiCloudAPIResponseError
 
 from icloudpd.logger import setup_logger
@@ -60,7 +62,7 @@ CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"])
 @click.option(
     "--size",
     help="Image size to download (default: original)",
-    type=click.Choice(["original", "medium", "thumb"]),
+    type=click.Choice(["original", "medium", "thumb", "full"]),
     default="original",
 )
 @click.option(
@@ -72,6 +74,11 @@ CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"])
 @click.option(
     "--recent",
     help="Number of recent photos to download (default: download all photos)",
+    type=click.IntRange(0),
+)
+@click.option(
+    "--skip-recent",
+    help="Skip photos created in last days (default: download all photos)",
     type=click.IntRange(0),
 )
 @click.option(
@@ -108,10 +115,26 @@ CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"])
     is_flag=True,
 )
 @click.option(
+    "--replace-changes",
+    help="Replace downloaded image if there are changes"
+    + "(default: rename with the size)",
+    is_flag=True,
+)
+@click.option(
     "--auto-delete",
     help='Scans the "Recently Deleted" folder and deletes any files found in there. '
     + "(If you restore the photo in iCloud, it will be downloaded again.)",
     is_flag=True,
+)
+@click.option(
+    "--delete-downloaded",
+    help="Delete the file after downloading",
+    is_flag=True
+)
+@click.option(
+    "--skip-sync-days",
+    help="Only auto-delete the photos in the selected days if active or delete downloaded only to selected days ago",
+    type=click.IntRange(0),
 )
 @click.option(
     "--only-print-filenames",
@@ -204,13 +227,17 @@ def main(
         size,
         live_photo_size,
         recent,
+        skip_recent,
         until_found,
         album,
         list_albums,
         skip_videos,
         skip_live_photos,
         force_size,
+        replace_changes,
         auto_delete,
+        delete_downloaded,
+        skip_sync_days,
         only_print_filenames,
         folder_structure,
         set_exif_datetime,
@@ -319,13 +346,18 @@ def main(
 
     photos.exception_handler = photos_exception_handler
 
-    photos_count = len(photos)
-
     # Optional: Only download the x most recent photos.
     if recent is not None:
-        photos_count = recent
         photos = itertools.islice(photos, recent)
 
+    # Optional: Skip photos created in last days.
+    if skip_recent is not None:
+        def filter_date(photo):
+            max_date = datetime.datetime.now(photo.created.tzinfo) - datetime.timedelta(days=skip_recent)
+            return photo.created < max_date
+        photos = list(filter(filter_date, photos))
+
+    photos_count = len(photos)
     tqdm_kwargs = {"total": photos_count}
 
     if until_found is not None:
@@ -442,14 +474,6 @@ def main(
             photo, download_size, download_dir)
 
         file_exists = os.path.isfile(download_path)
-        if not file_exists and download_size == "original":
-            # Deprecation - We used to download files like IMG_1234-original.jpg,
-            # so we need to check for these.
-            # Now we match the behavior of iCloud for Windows: IMG_1234.jpg
-            original_download_path = ("-%s." % size).join(
-                download_path.rsplit(".", 1)
-            )
-            file_exists = os.path.isfile(original_download_path)
 
         if file_exists:
             # for later: this crashes if download-size medium is specified
@@ -457,18 +481,24 @@ def main(
             version = photo.versions[download_size]
             photo_size = version["size"]
             if file_size != photo_size:
-                download_path = ("-%s." % photo_size).join(
-                    download_path.rsplit(".", 1)
-                )
-                logger.set_tqdm_description(
-                    "%s deduplicated." % truncate_middle(download_path, 96)
-                )
-                file_exists = os.path.isfile(download_path)
+                if not replace_changes:
+                    download_path = ("-%s." % photo_size).join(
+                        download_path.rsplit(".", 1)
+                    )
+                    logger.set_tqdm_description(
+                        "%s deduplicated." % truncate_middle(download_path, 96)
+                    )
+                    file_exists = os.path.isfile(download_path)
+                else:
+                    file_exists = False
             if file_exists:
                 counter.increment()
                 logger.set_tqdm_description(
                     "%s already exists." % truncate_middle(download_path, 96)
                 )
+            max_date = datetime.datetime.now(created_date.tzinfo) - datetime.timedelta(days=skip_sync_days)
+            if delete_downloaded and created_date < max_date:
+                move_picture_to_recently_deleted(icloud, photo)
 
         if not file_exists:
             counter.reset()
@@ -500,6 +530,10 @@ def main(
                             created_date.strftime("%Y:%m:%d %H:%M:%S"),
                         )
                     download.set_utime(download_path, created_date)
+
+                    max_date = datetime.datetime.now(created_date.tzinfo) - datetime.timedelta(days=skip_sync_days)
+                    if delete_downloaded and created_date < max_date:
+                        move_picture_to_recently_deleted(icloud, photo)
 
         # Also download the live photo if present
         if not skip_live_photos:
@@ -544,6 +578,31 @@ def main(
                             icloud, photo, lp_download_path, lp_size
                         )
 
+    def move_picture_to_recently_deleted(icloud, photo):
+        url = '{}/records/modify?{}'.format(icloud.photos._service_endpoint, urlencode(icloud.photos.params))
+        headers = {'Content-type': 'text/plain'}
+
+        mr = {'fields': {'isDeleted': {'value': 1}}}
+        mr['recordChangeTag'] = photo._asset_record['recordChangeTag']
+        mr['recordName'] = photo._asset_record['recordName']
+
+        mr['recordType'] = 'CPLAsset'
+        op = dict(
+            operationType='update',
+            record=mr,
+        )
+        operations = []
+        operations.append(op)
+
+        post_data = json.dumps(dict(
+            atomic=True,
+            desiredKeys=['isDeleted'],
+            operations=operations,
+            zoneID={'zoneName': 'PrimarySync'},
+        ))
+
+        icloud.photos.session.post(url, data=post_data, headers=headers).json()
+
     consecutive_files_found = Counter(0)
 
     def should_break(counter):
@@ -569,4 +628,4 @@ def main(
     logger.info("All photos have been downloaded!")
 
     if auto_delete:
-        autodelete_photos(icloud, folder_structure, directory)
+        autodelete_photos(icloud, folder_structure, directory, skip_sync_days)

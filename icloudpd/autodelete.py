@@ -2,11 +2,12 @@
 Delete any files found in "Recently Deleted"
 """
 import os
+import datetime
 from icloudpd.logger import setup_logger
 from icloudpd.paths import local_download_path
 
 
-def autodelete_photos(icloud, folder_structure, directory):
+def autodelete_photos(icloud, folder_structure, directory, limit):
     """
     Scans the "Recently Deleted" folder and deletes any matching files
     from the download directory.
@@ -21,11 +22,12 @@ def autodelete_photos(icloud, folder_structure, directory):
         created_date = media.created
         date_path = folder_structure.format(created_date)
         download_dir = os.path.join(directory, date_path)
-
-        for size in [None, "original", "medium", "thumb"]:
-            path = os.path.normpath(
-                local_download_path(
-                    media, size, download_dir))
-            if os.path.exists(path):
-                logger.info("Deleting %s!", path)
-                os.remove(path)
+        min_date = datetime.datetime.now(created_date.tzinfo) - datetime.timedelta(days=limit)
+        if created_date > min_date:
+            for size in [None, "original", "medium", "thumb", "full"]:
+                path = os.path.normpath(
+                    local_download_path(
+                        media, size, download_dir))
+                if os.path.exists(path):
+                    logger.info("Deleting %s!", path)
+                    os.remove(path)
